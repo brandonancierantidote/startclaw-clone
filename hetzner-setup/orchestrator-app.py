@@ -493,5 +493,242 @@ def test_litellm():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/services/whatsapp-bridge/deploy", methods=["POST"])
+@require_auth
+def deploy_whatsapp_bridge():
+    """
+    Deploy the WhatsApp bridge service
+    This builds and runs the whatsapp-web.js bridge container
+    """
+    container_name = "whatsapp-bridge"
+
+    try:
+        # Check if container already exists
+        try:
+            existing = docker_client.containers.get(container_name)
+            if existing.status == "running":
+                return jsonify({
+                    "success": True,
+                    "message": "WhatsApp bridge already running",
+                    "container_id": existing.id,
+                    "status": existing.status
+                })
+            else:
+                # Remove stopped container
+                existing.remove()
+        except docker.errors.NotFound:
+            pass
+
+        # Build the image from the Dockerfile
+        whatsapp_dir = "/opt/theone/whatsapp-bridge"
+
+        # Check if directory exists, if not create minimal setup
+        if not os.path.exists(whatsapp_dir):
+            os.makedirs(whatsapp_dir, exist_ok=True)
+
+            # Write package.json
+            package_json = {
+                "name": "whatsapp-bridge",
+                "version": "1.0.0",
+                "main": "index.js",
+                "dependencies": {
+                    "whatsapp-web.js": "^1.25.0",
+                    "express": "^4.18.2",
+                    "qrcode": "^1.5.3",
+                    "cors": "^2.8.5"
+                }
+            }
+            with open(os.path.join(whatsapp_dir, "package.json"), "w") as f:
+                json.dump(package_json, f, indent=2)
+
+            # Write index.js
+            index_js = '''const { Client, LocalAuth } = require("whatsapp-web.js");
+const express = require("express");
+const qrcode = require("qrcode");
+const cors = require("cors");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const sessions = new Map();
+
+function getOrCreateClient(sessionId) {
+  if (sessions.has(sessionId)) {
+    return sessions.get(sessionId);
+  }
+
+  const client = new Client({
+    authStrategy: new LocalAuth({ clientId: sessionId }),
+    puppeteer: {
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    }
+  });
+
+  const sessionData = { client, qr: null, ready: false, phone: null };
+  sessions.set(sessionId, sessionData);
+
+  client.on("qr", async (qr) => {
+    sessionData.qr = await qrcode.toDataURL(qr);
+    console.log(`QR generated for session ${sessionId}`);
+  });
+
+  client.on("ready", async () => {
+    sessionData.ready = true;
+    sessionData.qr = null;
+    const info = client.info;
+    sessionData.phone = info?.wid?.user || "unknown";
+    console.log(`Client ready for session ${sessionId}: ${sessionData.phone}`);
+  });
+
+  client.on("disconnected", () => {
+    sessionData.ready = false;
+    console.log(`Client disconnected for session ${sessionId}`);
+  });
+
+  client.initialize();
+  return sessionData;
+}
+
+app.get("/health", (req, res) => res.json({ status: "ok", sessions: sessions.size }));
+
+app.get("/whatsapp/qr/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  const session = getOrCreateClient(sessionId);
+
+  if (session.ready) {
+    return res.json({ authenticated: true, phone: session.phone });
+  }
+  if (session.qr) {
+    return res.json({ qr: session.qr, authenticated: false });
+  }
+  res.status(202).json({ status: "initializing" });
+});
+
+app.get("/whatsapp/status/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessions.has(sessionId)) {
+    return res.json({ connected: false });
+  }
+  const session = sessions.get(sessionId);
+  res.json({ connected: session.ready, phone: session.phone });
+});
+
+app.post("/whatsapp/send/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  const { to, message } = req.body;
+
+  if (!sessions.has(sessionId)) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session.ready) {
+    return res.status(400).json({ error: "Client not ready" });
+  }
+
+  try {
+    const chatId = to.includes("@") ? to : `${to}@c.us`;
+    await session.client.sendMessage(chatId, message);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, "0.0.0.0", () => console.log(`WhatsApp bridge running on port ${PORT}`));
+'''
+            with open(os.path.join(whatsapp_dir, "index.js"), "w") as f:
+                f.write(index_js)
+
+            # Write Dockerfile
+            dockerfile = '''FROM node:20-slim
+RUN apt-get update && apt-get install -y \\
+    chromium \\
+    libgbm-dev \\
+    libnss3 \\
+    libatk-bridge2.0-0 \\
+    libx11-xcb1 \\
+    libxcb-dri3-0 \\
+    libdrm2 \\
+    libxshmfence1 \\
+    libxrandr2 \\
+    libasound2 \\
+    libpangocairo-1.0-0 \\
+    libgtk-3-0 \\
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+WORKDIR /app
+COPY package.json .
+RUN npm install
+COPY index.js .
+EXPOSE 3001
+CMD ["node", "index.js"]
+'''
+            with open(os.path.join(whatsapp_dir, "Dockerfile"), "w") as f:
+                f.write(dockerfile)
+
+        # Build the Docker image
+        image, build_logs = docker_client.images.build(
+            path=whatsapp_dir,
+            tag="theone/whatsapp-bridge:latest",
+            rm=True
+        )
+
+        # Run the container
+        container = docker_client.containers.run(
+            "theone/whatsapp-bridge:latest",
+            name=container_name,
+            detach=True,
+            ports={"3001/tcp": 3001},
+            volumes={
+                "/opt/theone/whatsapp-sessions": {"bind": "/app/.wwebjs_auth", "mode": "rw"}
+            },
+            restart_policy={"Name": "unless-stopped"},
+            environment={
+                "PORT": "3001"
+            }
+        )
+
+        # Connect to theone network
+        try:
+            theone_network = docker_client.networks.get("theone_theone-network")
+            theone_network.connect(container)
+        except Exception:
+            pass  # Network might not exist yet
+
+        return jsonify({
+            "success": True,
+            "message": "WhatsApp bridge deployed successfully",
+            "container_id": container.id,
+            "container_name": container_name,
+            "port": 3001
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/services/whatsapp-bridge/status", methods=["GET"])
+def whatsapp_bridge_status():
+    """Check WhatsApp bridge service status"""
+    try:
+        container = docker_client.containers.get("whatsapp-bridge")
+        return jsonify({
+            "running": container.status == "running",
+            "status": container.status,
+            "container_id": container.id
+        })
+    except docker.errors.NotFound:
+        return jsonify({"running": False, "status": "not_deployed"})
+    except Exception as e:
+        return jsonify({"running": False, "error": str(e)})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
