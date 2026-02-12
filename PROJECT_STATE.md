@@ -1,7 +1,7 @@
 # Project State — The One
 
 ## Last Updated
-2026-02-12 21:24 UTC
+2026-02-12 21:32 UTC
 
 ## Architecture
 - **Frontend**: Next.js 15 (App Router), localhost:3000 dev, Vercel for production
@@ -201,12 +201,45 @@ All 8 tests passing:
 - LiteLLM integration
 - WhatsApp bridge health check (3 active sessions)
 
-## Next Steps
-1. **Push to GitHub** - Add SSH key to GitHub account and push
-2. **Configure Slack** - Add SLACK_CLIENT_ID and SLACK_CLIENT_SECRET
-3. **Set up Stripe webhooks** - Configure webhook endpoint in Stripe dashboard
-4. **Deploy to Vercel** - Connect repo and deploy frontend
-5. **Replace placeholder agent container** - Use actual OpenClaw image
-6. **Implement real credit tracking** - Wire LiteLLM callbacks to credit deduction
-7. **Add agent activity logging** - Populate activity_feed from running agents
-8. **End-to-end testing** - Full flow with real integrations
+## Setup Instructions
+
+### Step 1: Add SSH Key to GitHub
+1. Go to https://github.com/settings/keys
+2. Click "New SSH key"
+3. Paste this key:
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIkkiLHA0nbnqlnASEX9ymbzCo8/ShS/f7NvYdG3FqZK brandonancier@gmail.com
+```
+4. Run: `git push -u origin main`
+
+### Step 2: Run Supabase Migrations
+1. Go to https://supabase.com/dashboard/project/erhucjndgriwjckfifvf/sql
+2. Click "New Query"
+3. Paste entire contents of `supabase/migrations/001_initial_schema.sql`
+4. Click "Run"
+5. Then paste and run `supabase/seed.sql` to add 20 templates
+
+### Step 3: Deploy to Vercel
+1. Run: `vercel login`
+2. Visit the URL shown and authorize
+3. Run: `vercel --prod`
+4. Add environment variables in Vercel dashboard (copy from .env.local)
+
+### Step 4: Configure Slack (Optional)
+1. Go to https://api.slack.com/apps
+2. Click "Create New App" → "From scratch"
+3. Name: "The One Agent", Workspace: Your workspace
+4. OAuth & Permissions → Add scopes: channels:read, chat:write, users:read, users:read.email
+5. Install App to Workspace
+6. Copy Client ID and Client Secret to .env.local:
+```
+SLACK_CLIENT_ID=your-client-id
+SLACK_CLIENT_SECRET=your-client-secret
+```
+7. Add OAuth Redirect URL: `https://your-vercel-domain.vercel.app/api/integrations/slack/callback`
+
+## Remaining Work
+- Replace placeholder agent container with actual OpenClaw image
+- Implement real credit tracking from LiteLLM callbacks
+- Add agent activity logging to populate activity_feed
+- End-to-end testing with real integrations
