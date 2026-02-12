@@ -61,17 +61,15 @@ else
     fail "LiteLLM integration"
 fi
 
-# Test 5: WhatsApp Bridge Status
-result=$(curl -s "$ORCHESTRATOR_URL/api/services/whatsapp-bridge/status" 2>/dev/null)
-if echo "$result" | grep -q "running\|not_deployed"; then
-    pass "WhatsApp bridge status endpoint"
-    if echo "$result" | grep -q '"running": true'; then
-        echo "  → WhatsApp bridge is RUNNING"
-    else
-        echo "  → WhatsApp bridge is NOT DEPLOYED"
-    fi
+# Test 5: WhatsApp Bridge Health (direct check)
+WHATSAPP_BRIDGE_URL="${WHATSAPP_BRIDGE_URL:-http://46.225.107.94:3001}"
+result=$(curl -s "$WHATSAPP_BRIDGE_URL/health" 2>/dev/null)
+if echo "$result" | grep -q '"status":"ok"'; then
+    pass "WhatsApp bridge health check"
+    echo "  → WhatsApp bridge is RUNNING"
 else
-    fail "WhatsApp bridge status endpoint"
+    fail "WhatsApp bridge health check"
+    echo "  → WhatsApp bridge is NOT RUNNING"
 fi
 
 echo ""
