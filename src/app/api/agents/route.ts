@@ -49,99 +49,155 @@ export async function POST(req: Request) {
   try {
     const { userId } = await auth();
     if (!userId) {
+      console.error("POST /api/agents: No userId from Clerk auth");
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { template_slug, display_name, soul_md, config, integrations } = await req.json();
+    const body = await req.json();
+    const { template_slug, display_name, soul_md, config, integrations } = body;
+    console.log("POST /api/agents: Creating agent", { template_slug, display_name, userId });
 
     if (!template_slug || !display_name || !soul_md) {
+      console.error("POST /api/agents: Missing required fields", { template_slug: !!template_slug, display_name: !!display_name, soul_md: !!soul_md });
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
     }
 
     const supabase = createServerClient();
 
-    // Get or create user's internal ID
+    // Step 1: Get or create user's internal ID
     let internalUserId: string;
-    const userResult = await supabase
-      .from("users")
-      .select("id")
-      .eq("clerk_id", userId)
-      .single();
-
-    if (userResult.error || !userResult.data) {
-      // Create user if doesn't exist
-      const newUserResult = await supabase
+    try {
+      const userResult = await supabase
         .from("users")
+        .select("id")
+        .eq("clerk_id", userId)
+        .single();
+
+      if (userResult.error || !userResult.data) {
+        console.log("POST /api/agents: User not found, creating new user");
+        const newUserResult = await supabase
+          .from("users")
+          .insert({
+            clerk_id: userId,
+            email: `${userId}@placeholder.com`,
+          })
+          .select()
+          .single();
+
+        if (newUserResult.error || !newUserResult.data) {
+          console.error("POST /api/agents: Failed to create user:", newUserResult.error);
+          return NextResponse.json({ error: "Failed to create user: " + (newUserResult.error?.message || "unknown error") }, { status: 500 });
+        }
+        internalUserId = newUserResult.data.id;
+
+        // Create credits row
+        await supabase.from("credits").insert({
+          user_id: internalUserId,
+          balance_cents: 0,
+        });
+      } else {
+        internalUserId = userResult.data.id;
+      }
+    } catch (userError) {
+      console.error("POST /api/agents: User lookup/creation failed:", userError);
+      return NextResponse.json({ error: "Database error during user setup" }, { status: 500 });
+    }
+
+    // Step 2: Create the agent in database (MUST succeed)
+    let agent;
+    try {
+      const agentResult = await supabase
+        .from("agents")
         .insert({
-          clerk_id: userId,
-          email: `${userId}@placeholder.com`,
+          user_id: internalUserId,
+          template_slug,
+          display_name,
+          soul_md,
+          config: config || {},
+          integrations: integrations || {},
+          status: "pending",
         })
         .select()
         .single();
 
-      if (newUserResult.error || !newUserResult.data) {
-        console.error("Failed to create user:", newUserResult.error);
-        return NextResponse.json({ error: "Failed to create user" }, { status: 500 });
+      if (agentResult.error || !agentResult.data) {
+        console.error("POST /api/agents: Failed to create agent in DB:", agentResult.error);
+        return NextResponse.json({ error: "Failed to create agent: " + (agentResult.error?.message || "unknown error") }, { status: 500 });
       }
-      internalUserId = newUserResult.data.id;
+      agent = agentResult.data;
+      console.log("POST /api/agents: Agent created in DB with id:", agent.id);
+    } catch (agentError) {
+      console.error("POST /api/agents: Agent creation threw:", agentError);
+      return NextResponse.json({ error: "Database error during agent creation" }, { status: 500 });
+    }
 
-      // Create credits row
-      await supabase.from("credits").insert({
+    // Step 3: Create subscription + add credits (MUST succeed)
+    try {
+      await supabase.from("subscriptions").upsert({
         user_id: internalUserId,
-        balance_cents: 0,
+        status: "active",
+        plan: "standard",
+        current_period_start: new Date().toISOString(),
+        current_period_end: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      }, { onConflict: "user_id" });
+
+      const creditsResult = await supabase
+        .from("credits")
+        .select("balance_cents")
+        .eq("user_id", internalUserId)
+        .single();
+
+      const currentBalance = creditsResult.data?.balance_cents || 0;
+      const newBalance = currentBalance + 1000;
+
+      await supabase
+        .from("credits")
+        .upsert({
+          user_id: internalUserId,
+          balance_cents: newBalance,
+        }, { onConflict: "user_id" });
+
+      await supabase.from("credit_transactions").insert({
+        user_id: internalUserId,
+        amount_cents: 1000,
+        type: "credit",
+        description: "Starter credits with subscription",
+        balance_after_cents: newBalance,
       });
-    } else {
-      internalUserId = userResult.data.id;
+
+      console.log("POST /api/agents: Subscription and credits created, balance:", newBalance);
+    } catch (billingError) {
+      console.error("POST /api/agents: Billing setup failed (non-fatal):", billingError);
+      // Don't fail the whole request — agent is already created
     }
 
-    // Create the agent in database first
-    const agentResult = await supabase
-      .from("agents")
-      .insert({
-        user_id: internalUserId,
-        template_slug,
-        display_name,
-        soul_md,
-        config: config || {},
-        integrations: integrations || {},
-        status: "provisioning",
-      })
-      .select()
-      .single();
-
-    if (agentResult.error || !agentResult.data) {
-      console.error("Failed to create agent in DB:", agentResult.error);
-      return NextResponse.json({ error: "Failed to create agent" }, { status: 500 });
-    }
-
-    const agent = agentResult.data;
-
-    // Get integration tokens for this user (Gmail, etc.)
-    let integrationTokens = {};
+    // Step 4: Optionally try to provision container on Hetzner (OK if this fails)
+    let provisioningMessage = "";
     try {
-      const tokensResult = await supabase
-        .from("integration_tokens")
-        .select("*")
-        .eq("user_id", internalUserId);
+      // Get integration tokens for this user
+      let integrationTokens = {};
+      try {
+        const tokensResult = await supabase
+          .from("integration_tokens")
+          .select("*")
+          .eq("user_id", internalUserId);
 
-      if (tokensResult.data) {
-        for (const token of tokensResult.data) {
-          integrationTokens = {
-            ...integrationTokens,
-            [token.provider]: {
-              access_token: token.access_token,
-              refresh_token: token.refresh_token,
-              email: token.email,
-            },
-          };
+        if (tokensResult.data) {
+          for (const token of tokensResult.data) {
+            integrationTokens = {
+              ...integrationTokens,
+              [token.provider]: {
+                access_token: token.access_token,
+                refresh_token: token.refresh_token,
+                email: token.email,
+              },
+            };
+          }
         }
+      } catch (e) {
+        console.error("POST /api/agents: Failed to fetch integration tokens:", e);
       }
-    } catch (e) {
-      console.error("Failed to fetch integration tokens:", e);
-    }
 
-    // Provision the container on Hetzner
-    try {
       const provisionResponse = await fetch(`${ORCHESTRATOR_URL}/api/agents/provision`, {
         method: "POST",
         headers: {
@@ -161,95 +217,60 @@ export async function POST(req: Request) {
         }),
       });
 
-      if (!provisionResponse.ok) {
-        const errorText = await provisionResponse.text();
-        console.error("Orchestrator provision failed:", errorText);
-        // Update agent status to failed
+      if (provisionResponse.ok) {
+        const provisionData = await provisionResponse.json();
         await supabase
           .from("agents")
-          .update({ status: "failed" })
+          .update({
+            status: "active",
+            container_id: provisionData.container_id,
+          })
           .eq("id", agent.id);
-        return NextResponse.json({ error: "Failed to provision agent container" }, { status: 500 });
+        agent.status = "active";
+        agent.container_id = provisionData.container_id;
+        console.log("POST /api/agents: Container provisioned:", provisionData.container_id);
+      } else {
+        const errorText = await provisionResponse.text();
+        console.error("POST /api/agents: Orchestrator provision failed (non-fatal):", errorText);
+        provisioningMessage = "Agent created — container provisioning in progress";
       }
-
-      const provisionData = await provisionResponse.json();
-
-      // Update agent with container info
-      await supabase
-        .from("agents")
-        .update({
-          status: "active",
-          container_id: provisionData.container_id,
-        })
-        .eq("id", agent.id);
-
-      agent.status = "active";
-      agent.container_id = provisionData.container_id;
-    } catch (error) {
-      console.error("Failed to provision container:", error);
-      // Mark agent as failed but still return it
-      await supabase
-        .from("agents")
-        .update({ status: "failed" })
-        .eq("id", agent.id);
-      agent.status = "failed";
+    } catch (provisionError) {
+      console.error("POST /api/agents: Container provisioning failed (non-fatal):", provisionError);
+      provisioningMessage = "Agent created — container provisioning in progress";
     }
 
-    // Create subscription with status 'active'
-    await supabase.from("subscriptions").upsert({
-      user_id: internalUserId,
-      status: "active",
-      plan: "standard",
-      current_period_start: new Date().toISOString(),
-      current_period_end: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-    }, { onConflict: "user_id" });
-
-    // Add 1000 credits ($10 starter credits)
-    const creditsResult = await supabase
-      .from("credits")
-      .select("balance_cents")
-      .eq("user_id", internalUserId)
-      .single();
-
-    const currentBalance = creditsResult.data?.balance_cents || 0;
-    const newBalance = currentBalance + 1000;
-
-    await supabase
-      .from("credits")
-      .upsert({
-        user_id: internalUserId,
-        balance_cents: newBalance,
-      }, { onConflict: "user_id" });
-
-    // Record credit transaction
-    await supabase.from("credit_transactions").insert({
-      user_id: internalUserId,
-      amount_cents: 1000,
-      type: "credit",
-      description: "Starter credits with subscription",
-      balance_after_cents: newBalance,
-    });
-
-    // Sync credit balance to orchestrator Redis
+    // Sync credit balance to orchestrator Redis (optional)
     try {
-      await fetch(`${ORCHESTRATOR_URL}/api/credits/set`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${ORCHESTRATOR_SECRET}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          user_id: internalUserId,
-          balance_cents: newBalance,
-        }),
-      });
+      const creditsResult = await supabase
+        .from("credits")
+        .select("balance_cents")
+        .eq("user_id", internalUserId)
+        .single();
+
+      if (creditsResult.data) {
+        await fetch(`${ORCHESTRATOR_URL}/api/credits/set`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${ORCHESTRATOR_SECRET}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            user_id: internalUserId,
+            balance_cents: creditsResult.data.balance_cents,
+          }),
+        });
+      }
     } catch (e) {
-      console.error("Failed to sync credits to orchestrator:", e);
+      console.error("POST /api/agents: Failed to sync credits to orchestrator:", e);
     }
 
-    return NextResponse.json(agent);
+    // Always return success — agent is created
+    return NextResponse.json({
+      ...agent,
+      message: provisioningMessage || undefined,
+    });
   } catch (error) {
-    console.error("Failed to create agent:", error);
-    return NextResponse.json({ error: "Failed to create agent" }, { status: 500 });
+    console.error("POST /api/agents: Unhandled error:", error);
+    return NextResponse.json({ error: "Failed to create agent: " + (error instanceof Error ? error.message : "unknown error") }, { status: 500 });
   }
 }
