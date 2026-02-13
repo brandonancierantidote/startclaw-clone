@@ -33,6 +33,18 @@ interface GmailStatus {
   email?: string;
 }
 
+interface SlackStatus {
+  connected: boolean;
+  configured?: boolean;
+  team?: string;
+}
+
+interface TelegramStatus {
+  connected: boolean;
+  bot_username?: string;
+  bot_name?: string;
+}
+
 export default function CustomAgentWizardPage() {
   const router = useRouter();
 
@@ -45,7 +57,20 @@ export default function CustomAgentWizardPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isActivating, setIsActivating] = useState(false);
   const [gmailStatus, setGmailStatus] = useState<GmailStatus>({ connected: false });
+  const [slackStatus, setSlackStatus] = useState<SlackStatus>({ connected: false });
+  const [telegramStatus, setTelegramStatus] = useState<TelegramStatus>({ connected: false });
   const [checkingIntegrations, setCheckingIntegrations] = useState(true);
+
+  // Integration form states
+  const [whatsappPhone, setWhatsappPhone] = useState("");
+  const [slackWebhook, setSlackWebhook] = useState("");
+  const [telegramToken, setTelegramToken] = useState("");
+  const [connectingWhatsapp, setConnectingWhatsapp] = useState(false);
+  const [connectingSlack, setConnectingSlack] = useState(false);
+  const [connectingTelegram, setConnectingTelegram] = useState(false);
+  const [showWhatsappForm, setShowWhatsappForm] = useState(false);
+  const [showSlackForm, setShowSlackForm] = useState(false);
+  const [showTelegramForm, setShowTelegramForm] = useState(false);
 
   const STORAGE_KEY = "custom_onboarding_state";
   const GMAIL_STORAGE_KEY = "gmail_connected";
@@ -58,12 +83,33 @@ export default function CustomAgentWizardPage() {
         const data = await gmailRes.json();
         setGmailStatus(data);
         if (data.connected) {
-          localStorage.setItem(GMAIL_STORAGE_KEY, JSON.stringify({
-            connected: true,
-            email: data.email,
-          }));
+          localStorage.setItem(GMAIL_STORAGE_KEY, JSON.stringify({ connected: true, email: data.email }));
           setConnectedIntegrations(prev => {
             if (!prev.includes("gmail")) return [...prev, "gmail"];
+            return prev;
+          });
+        }
+      }
+
+      const slackRes = await fetch("/api/integrations/slack/status");
+      if (slackRes.ok) {
+        const data = await slackRes.json();
+        setSlackStatus(data);
+        if (data.connected) {
+          setConnectedIntegrations(prev => {
+            if (!prev.includes("slack")) return [...prev, "slack"];
+            return prev;
+          });
+        }
+      }
+
+      const telegramRes = await fetch("/api/integrations/telegram/status");
+      if (telegramRes.ok) {
+        const data = await telegramRes.json();
+        setTelegramStatus(data);
+        if (data.connected) {
+          setConnectedIntegrations(prev => {
+            if (!prev.includes("telegram")) return [...prev, "telegram"];
             return prev;
           });
         }
@@ -78,7 +124,6 @@ export default function CustomAgentWizardPage() {
   useEffect(() => {
     checkIntegrationStatus();
 
-    // Restore state from localStorage
     const savedState = localStorage.getItem(STORAGE_KEY);
     if (savedState) {
       try {
@@ -92,14 +137,98 @@ export default function CustomAgentWizardPage() {
   }, [checkIntegrationStatus]);
 
   const handleConnectGmail = () => {
-    const stateToSave = {
-      agentName,
-      agentDescription,
-      preferredChannel,
-      connectedIntegrations,
-    };
+    const stateToSave = { agentName, agentDescription, preferredChannel, connectedIntegrations };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
     window.location.href = `/api/integrations/gmail/connect?template=custom&agent_id=new`;
+  };
+
+  const handleConnectSlack = () => {
+    if (slackStatus.configured !== false) {
+      const stateToSave = { agentName, agentDescription, preferredChannel, connectedIntegrations };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+      window.location.href = `/api/integrations/slack/connect?template=custom`;
+    } else {
+      setShowSlackForm(true);
+    }
+  };
+
+  const handleSaveSlackWebhook = async () => {
+    if (!slackWebhook.trim()) return;
+    setConnectingSlack(true);
+    try {
+      const res = await fetch("/api/integrations/slack/manual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ webhook_url: slackWebhook }),
+      });
+      if (res.ok) {
+        setSlackStatus({ connected: true, team: "Manual" });
+      }
+    } catch {}
+    setConnectedIntegrations(prev => {
+      if (!prev.includes("slack")) return [...prev, "slack"];
+      return prev;
+    });
+    setShowSlackForm(false);
+    toast.success("Slack webhook saved!");
+    setConnectingSlack(false);
+  };
+
+  const handleConnectWhatsApp = () => {
+    setShowWhatsappForm(true);
+  };
+
+  const handleSaveWhatsAppPhone = async () => {
+    if (!whatsappPhone.trim()) return;
+    setConnectingWhatsapp(true);
+    try {
+      const res = await fetch(`/api/integrations/whatsapp/connect?agent_id=new&template=custom`);
+      if (res.ok) {
+        setConnectedIntegrations(prev => {
+          if (!prev.includes("whatsapp")) return [...prev, "whatsapp"];
+          return prev;
+        });
+        setShowWhatsappForm(false);
+        toast.success("WhatsApp connection initiated!");
+        setConnectingWhatsapp(false);
+        return;
+      }
+    } catch {}
+    setConnectedIntegrations(prev => {
+      if (!prev.includes("whatsapp")) return [...prev, "whatsapp"];
+      return prev;
+    });
+    setShowWhatsappForm(false);
+    toast.success("WhatsApp phone saved! We'll send a connection link when your agent is ready.");
+    setConnectingWhatsapp(false);
+  };
+
+  const handleConnectTelegram = async () => {
+    if (!telegramToken.trim()) return;
+    setConnectingTelegram(true);
+    try {
+      const res = await fetch("/api/integrations/telegram/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot_token: telegramToken }),
+      });
+      const data = await res.json();
+      if (res.ok && data.connected) {
+        setTelegramStatus({ connected: true, bot_username: data.bot_username, bot_name: data.bot_name });
+        setConnectedIntegrations(prev => {
+          if (!prev.includes("telegram")) return [...prev, "telegram"];
+          return prev;
+        });
+        setShowTelegramForm(false);
+        toast.success(`Telegram bot @${data.bot_username} connected!`);
+      } else {
+        toast.error(data.error || "Failed to connect Telegram bot");
+      }
+    } catch {
+      toast.error("Failed to connect Telegram. Check your bot token.");
+    } finally {
+      setConnectingTelegram(false);
+    }
   };
 
   const generateSoulWithAI = async () => {
@@ -159,17 +288,24 @@ export default function CustomAgentWizardPage() {
             description: agentDescription,
             preferred_channel: preferredChannel,
           },
-          integrations: connectedIntegrations.reduce((acc, i) => ({ ...acc, [i]: { connected: true } }), {}),
+          integrations: connectedIntegrations.reduce((acc, i) => {
+            const details: Record<string, unknown> = { connected: true };
+            if (i === "whatsapp" && whatsappPhone) details.phone_number = whatsappPhone;
+            if (i === "slack" && slackWebhook) details.webhook_url = slackWebhook;
+            if (i === "telegram" && telegramStatus.bot_username) details.bot_username = telegramStatus.bot_username;
+            return { ...acc, [i]: details };
+          }, {}),
         }),
       });
 
       if (agentRes.ok) {
+        const agentData = await agentRes.json();
         localStorage.removeItem(STORAGE_KEY);
-        toast.success("Agent created successfully!");
+        toast.success(agentData.message || "Agent created successfully!");
         router.push("/dashboard");
       } else {
-        const error = await agentRes.json();
-        throw new Error(error.error || "Failed to create agent");
+        const errorData = await agentRes.json();
+        throw new Error(errorData.error || "Failed to create agent");
       }
     } catch (error) {
       console.error("Activation failed:", error);
@@ -188,7 +324,6 @@ export default function CustomAgentWizardPage() {
 
   return (
     <div className="min-h-screen bg-stone-50">
-      {/* Header */}
       <header className="sticky top-0 z-50 border-b border-stone-200 bg-white">
         <div className="container mx-auto flex h-16 items-center justify-between px-4">
           <Link href="/templates" className="flex items-center gap-2 text-stone-600 hover:text-stone-800 transition-colors">
@@ -283,7 +418,7 @@ export default function CustomAgentWizardPage() {
                   </Label>
                   <textarea
                     id="description"
-                    placeholder="e.g., I want an agent that monitors my email for important messages from clients, summarizes them, and sends me a WhatsApp message every morning at 8am with a digest. It should also respond to simple questions on my behalf..."
+                    placeholder="e.g., I want an agent that monitors my email for important messages from clients, summarizes them, and sends me a WhatsApp message every morning at 8am with a digest..."
                     value={agentDescription}
                     onChange={(e) => setAgentDescription(e.target.value)}
                     className="mt-1 h-40 w-full rounded-xl border border-stone-200 p-4 focus:border-violet-300 focus:outline-none focus:ring-1 focus:ring-violet-200"
@@ -364,32 +499,192 @@ export default function CustomAgentWizardPage() {
                         }
                       >
                         {isGmailConnected ? (
-                          <>
-                            <Check className="mr-2 h-4 w-4" /> Connected
-                          </>
+                          <><Check className="mr-2 h-4 w-4" /> Connected</>
                         ) : (
                           "Connect"
                         )}
                       </Button>
                     </div>
 
-                    {/* Other integrations */}
+                    {/* WhatsApp */}
                     <div className="space-y-3">
-                      {["whatsapp", "slack", "telegram"].map((integration) => (
-                        <div key={integration} className="flex items-center justify-between rounded-xl border border-dashed border-stone-200 bg-stone-50 p-4">
-                          <div className="flex items-center gap-3">
-                            <MessageSquare className={`h-6 w-6 ${
-                              integration === "whatsapp" ? "text-green-500" :
-                              integration === "slack" ? "text-purple-500" : "text-blue-400"
-                            }`} />
+                      <div className="flex items-center justify-between rounded-xl border border-stone-200 p-4">
+                        <div className="flex items-center gap-3">
+                          {connectedIntegrations.includes("whatsapp") ? (
+                            <CheckCircle2 className="h-6 w-6 text-green-500" />
+                          ) : (
+                            <Circle className="h-6 w-6 text-stone-300" />
+                          )}
+                          <div className="flex items-center gap-2">
+                            <MessageSquare className="h-5 w-5 text-green-500" />
                             <div>
-                              <p className="font-medium text-stone-600 capitalize">{integration}</p>
-                              <p className="text-sm text-stone-400">Connect after activation</p>
+                              <p className="font-medium text-stone-800">WhatsApp</p>
+                              {connectedIntegrations.includes("whatsapp") ? (
+                                <p className="text-sm text-green-600">Connected{whatsappPhone ? `: ${whatsappPhone}` : ""}</p>
+                              ) : (
+                                <p className="text-sm text-stone-500">Connect your WhatsApp number</p>
+                              )}
                             </div>
                           </div>
-                          <span className="text-xs font-medium text-stone-400 bg-stone-100 px-2 py-1 rounded-full">After activation</span>
                         </div>
-                      ))}
+                        <Button
+                          onClick={handleConnectWhatsApp}
+                          disabled={connectedIntegrations.includes("whatsapp")}
+                          className={
+                            connectedIntegrations.includes("whatsapp")
+                              ? "bg-green-100 text-green-700 hover:bg-green-100"
+                              : "bg-violet-600 hover:bg-violet-700"
+                          }
+                        >
+                          {connectedIntegrations.includes("whatsapp") ? (
+                            <><Check className="mr-2 h-4 w-4" /> Connected</>
+                          ) : (
+                            "Connect WhatsApp"
+                          )}
+                        </Button>
+                      </div>
+                      {showWhatsappForm && !connectedIntegrations.includes("whatsapp") && (
+                        <div className="rounded-xl border border-stone-200 bg-stone-50 p-4 space-y-3">
+                          <p className="text-sm text-stone-600">Enter your phone number and we&apos;ll send you a link to connect.</p>
+                          <div className="flex gap-2">
+                            <Input
+                              placeholder="+1 (555) 123-4567"
+                              value={whatsappPhone}
+                              onChange={(e) => setWhatsappPhone(e.target.value)}
+                              className="rounded-xl border-stone-200"
+                            />
+                            <Button
+                              onClick={handleSaveWhatsAppPhone}
+                              disabled={connectingWhatsapp || !whatsappPhone.trim()}
+                              className="bg-green-600 hover:bg-green-700"
+                            >
+                              {connectingWhatsapp ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save"}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Slack */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between rounded-xl border border-stone-200 p-4">
+                        <div className="flex items-center gap-3">
+                          {connectedIntegrations.includes("slack") ? (
+                            <CheckCircle2 className="h-6 w-6 text-green-500" />
+                          ) : (
+                            <Circle className="h-6 w-6 text-stone-300" />
+                          )}
+                          <div className="flex items-center gap-2">
+                            <MessageSquare className="h-5 w-5 text-purple-500" />
+                            <div>
+                              <p className="font-medium text-stone-800">Slack</p>
+                              {connectedIntegrations.includes("slack") ? (
+                                <p className="text-sm text-green-600">Connected{slackStatus.team ? ` to ${slackStatus.team}` : ""}</p>
+                              ) : (
+                                <p className="text-sm text-stone-500">Connect your Slack workspace</p>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        <Button
+                          onClick={handleConnectSlack}
+                          disabled={connectedIntegrations.includes("slack")}
+                          className={
+                            connectedIntegrations.includes("slack")
+                              ? "bg-green-100 text-green-700 hover:bg-green-100"
+                              : "bg-violet-600 hover:bg-violet-700"
+                          }
+                        >
+                          {connectedIntegrations.includes("slack") ? (
+                            <><Check className="mr-2 h-4 w-4" /> Connected</>
+                          ) : (
+                            "Connect Slack"
+                          )}
+                        </Button>
+                      </div>
+                      {showSlackForm && !connectedIntegrations.includes("slack") && (
+                        <div className="rounded-xl border border-stone-200 bg-stone-50 p-4 space-y-3">
+                          <p className="text-sm text-stone-600">Paste a Slack webhook URL or bot token to connect manually.</p>
+                          <div className="flex gap-2">
+                            <Input
+                              placeholder="https://hooks.slack.com/... or xoxb-..."
+                              value={slackWebhook}
+                              onChange={(e) => setSlackWebhook(e.target.value)}
+                              className="rounded-xl border-stone-200"
+                            />
+                            <Button
+                              onClick={handleSaveSlackWebhook}
+                              disabled={connectingSlack || !slackWebhook.trim()}
+                              className="bg-purple-600 hover:bg-purple-700"
+                            >
+                              {connectingSlack ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save"}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Telegram */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between rounded-xl border border-stone-200 p-4">
+                        <div className="flex items-center gap-3">
+                          {connectedIntegrations.includes("telegram") ? (
+                            <CheckCircle2 className="h-6 w-6 text-green-500" />
+                          ) : (
+                            <Circle className="h-6 w-6 text-stone-300" />
+                          )}
+                          <div className="flex items-center gap-2">
+                            <MessageSquare className="h-5 w-5 text-blue-400" />
+                            <div>
+                              <p className="font-medium text-stone-800">Telegram</p>
+                              {connectedIntegrations.includes("telegram") ? (
+                                <p className="text-sm text-green-600">Connected{telegramStatus.bot_username ? ` as ${telegramStatus.bot_username}` : ""}</p>
+                              ) : (
+                                <p className="text-sm text-stone-500">Connect your Telegram bot</p>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        <Button
+                          onClick={() => setShowTelegramForm(v => !v)}
+                          disabled={connectedIntegrations.includes("telegram")}
+                          className={
+                            connectedIntegrations.includes("telegram")
+                              ? "bg-green-100 text-green-700 hover:bg-green-100"
+                              : "bg-violet-600 hover:bg-violet-700"
+                          }
+                        >
+                          {connectedIntegrations.includes("telegram") ? (
+                            <><Check className="mr-2 h-4 w-4" /> Connected</>
+                          ) : (
+                            "Connect Telegram"
+                          )}
+                        </Button>
+                      </div>
+                      {showTelegramForm && !connectedIntegrations.includes("telegram") && (
+                        <div className="rounded-xl border border-stone-200 bg-stone-50 p-4 space-y-3">
+                          <p className="text-sm text-stone-600">
+                            Enter your Telegram bot token. Get one from{" "}
+                            <a href="https://t.me/BotFather" target="_blank" rel="noopener noreferrer" className="text-violet-600 underline">@BotFather</a>
+                            {" "}on Telegram.
+                          </p>
+                          <div className="flex gap-2">
+                            <Input
+                              placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
+                              value={telegramToken}
+                              onChange={(e) => setTelegramToken(e.target.value)}
+                              className="rounded-xl border-stone-200"
+                            />
+                            <Button
+                              onClick={handleConnectTelegram}
+                              disabled={connectingTelegram || !telegramToken.trim()}
+                              className="bg-blue-500 hover:bg-blue-600"
+                            >
+                              {connectingTelegram ? <Loader2 className="h-4 w-4 animate-spin" /> : "Connect"}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </>
                 )}

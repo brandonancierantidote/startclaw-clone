@@ -19,43 +19,63 @@ export async function GET(req: Request) {
 
     const supabase = createServerClient();
 
-    // Get user's internal ID
-    const userResult = await supabase
-      .from("users")
-      .select("id")
-      .eq("clerk_id", userId)
-      .single();
+    // Get or create user's internal ID
+    let internalUserId: string = userId; // Default to clerk_id
+    try {
+      const userResult = await supabase
+        .from("users")
+        .select("id")
+        .eq("clerk_id", userId)
+        .single();
 
-    if (userResult.error || !userResult.data) {
-      return NextResponse.redirect(`${appUrl}/templates/${templateSlug}?error=user_not_found`);
+      if (userResult.data) {
+        internalUserId = userResult.data.id;
+      } else {
+        // Create user during onboarding
+        const newUserResult = await supabase
+          .from("users")
+          .insert({ clerk_id: userId, email: `${userId}@placeholder.com` })
+          .select()
+          .single();
+
+        if (newUserResult.data) {
+          internalUserId = newUserResult.data.id;
+        }
+      }
+    } catch {
+      // Use clerk_id as fallback
     }
-
-    const internalUserId = userResult.data.id;
 
     // Request a WhatsApp session from the orchestrator
-    const response = await fetch(`${ORCHESTRATOR_URL}/api/whatsapp/session`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${ORCHESTRATOR_SECRET}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        user_id: internalUserId,
-        agent_id: agentId,
-      }),
-    });
+    try {
+      const response = await fetch(`${ORCHESTRATOR_URL}/api/whatsapp/session`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ORCHESTRATOR_SECRET}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          user_id: internalUserId,
+          agent_id: agentId,
+        }),
+      });
 
-    if (!response.ok) {
+      if (response.ok) {
+        const data = await response.json();
+        return NextResponse.redirect(
+          `${appUrl}/templates/${templateSlug}?whatsapp_session=${data.session_id}&step=1&connected=whatsapp`
+        );
+      }
+
       const errorText = await response.text();
       console.error("Failed to create WhatsApp session:", errorText);
-      return NextResponse.redirect(`${appUrl}/templates/${templateSlug}?error=whatsapp_session_failed`);
+    } catch (orchError) {
+      console.error("Orchestrator connection failed:", orchError);
     }
 
-    const data = await response.json();
-
-    // Redirect to QR code page
+    // If orchestrator fails, redirect back with a message to use phone number fallback
     return NextResponse.redirect(
-      `${appUrl}/templates/${templateSlug}?whatsapp_session=${data.session_id}&step=2`
+      `${appUrl}/templates/${templateSlug}?step=1&whatsapp_fallback=true`
     );
   } catch (error) {
     console.error("WhatsApp connect error:", error);
